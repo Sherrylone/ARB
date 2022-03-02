@@ -30,11 +30,11 @@ parser.add_argument('--epochs', default=100, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--batch-size', default=2048, type=int, metavar='N',
                     help='mini-batch size')
-parser.add_argument('--learning-rate-weights', default=0.2, type=float, metavar='LR',
+parser.add_argument('--learning-rate-weights', default=0.3, type=float, metavar='LR',
                     help='base learning rate for weights')
 parser.add_argument('--learning-rate-biases', default=0.0048, type=float, metavar='LR',
                     help='base learning rate for biases and batch norm parameters')
-parser.add_argument('--weight-decay', default=1e-6, type=float, metavar='W',
+parser.add_argument('--weight-decay', default=1e-4, type=float, metavar='W',
                     help='weight decay')
 parser.add_argument('--lambd', default=0.0051, type=float, metavar='L',
                     help='weight on off-diagonal terms')
@@ -42,14 +42,15 @@ parser.add_argument('--projector', default='8192-8192-8192', type=str,
                     metavar='MLP', help='projector MLP')
 parser.add_argument('--print-freq', default=100, type=int, metavar='N',
                     help='print frequency')
-parser.add_argument('--checkpoint-dir', default='./checkpoint/', type=Path,
+parser.add_argument('--checkpoint-dir', default='/mnt/lustre/zhangshaofeng/workspace/assignment_224/checkpoint/', type=Path,
                     metavar='DIR', help='path to checkpoint directory')
 parser.add_argument('--method', default='fea', type=str,
-                    metavar='INS', help='instance whitening or feature whitening')
+                    metavar='INS')
 parser.add_argument('--backbone', default='resnet18', type=str, help='resnet18 and resnet50')
 parser.add_argument('--group', default=1, type=int, help='group of divided')
 parser.add_argument('--swap', default='true', type=str, help='swap on feature dimension')
 parser.add_argument('--temperature', default=0.5, type=float, help='simclr temperature')
+parser.add_argument('--resume', default="/mnt/lustre/zhangshaofeng/workspace/", type=Path, help='re-train')
 
 def main():
     args = parser.parse_args()
@@ -77,7 +78,7 @@ def main():
 
 def main_worker(gpu, args, local_rank):
     args.rank += gpu
-    hidden = args.projector.split('-')[0]
+    hidden = args.projector.split('-')[-1]
     args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
     stats_str = "stats-%s-%s-%d-%d-%s.txt" % (args.dataset, args.method, int(hidden), args.batch_size, args.backbone)
     stats_file = open(args.checkpoint_dir / stats_str, 'a', buffering=1)
@@ -112,9 +113,8 @@ def main_worker(gpu, args, local_rank):
                      lars_adaptation_filter=exclude_bias_and_norm)
 
     # automatically resume from checkpoint if it exists
-    if (args.checkpoint_dir / checkpoint_str).is_file():
-        ckpt = torch.load(args.checkpoint_dir / checkpoint_str,
-                          map_location='cpu')
+    if (args.resume).is_file():
+        ckpt = torch.load(args.resume, map_location='cpu')
         start_epoch = ckpt['epoch']
         model.load_state_dict(ckpt['model'])
         optimizer.load_state_dict(ckpt['optimizer'])
@@ -157,6 +157,9 @@ def main_worker(gpu, args, local_rank):
         if args.rank == 0:
             state = dict(epoch=epoch + 1, model=model.state_dict(),
                          optimizer=optimizer.state_dict())
+            if epoch % 20 == 0:
+                torch.save(state, args.checkpoint_dir / (str(epoch) + checkpoint_str))
+
 
             torch.save(state, args.checkpoint_dir / checkpoint_str)
             torch.save(model.module.backbone.state_dict(), args.checkpoint_dir / resnet_str)
@@ -251,20 +254,21 @@ def assignment_fea_loss(z1, z2, args):
         idx = torch.randperm(z1.size(0))
         z1 = z1[idx, :]
         z2 = z2[idx, :]
-    whiten_net = WhitenTran(args)
+    nobsnet = NOBS(args)
     z1 = standardization(z1)
     z2 = standardization(z2)
-    z1_group = whiten_net.zca_forward(z1).detach()
-    z2_group = whiten_net.zca_forward(z2).detach()
+    z1_group = nobsnet.find_nobs(z1).detach()
+    z2_group = nobsnet.find_nobs(z2).detach()
 
+    d1, d2 = z1.size()
     c = (z1 * z2_group).sum(dim=-1)
     c.div_(args.batch_size)
-    torch.distributed.all_reduce(c)
+    # torch.distributed.all_reduce(c)
     loss1 = c.add_(-1).pow_(2).sum()
 
     c = (z2 * z1_group).sum(dim=-1)
     c.div_(args.batch_size)
-    torch.distributed.all_reduce(c)
+    # torch.distributed.all_reduce(c)
     loss2 = c.add_(-1).pow_(2).sum()
 
     loss = loss1 + loss2
@@ -289,27 +293,28 @@ def standardization(data, eps=1e-5):
     sigma = torch.std(data, dim=-1, keepdim=True)
     return (data - mu) / (sigma+eps)
 
-class WhitenTran(nn.Module):
+class NOBS(nn.Module):
     def __init__(self, args):
-        super(WhitenTran, self).__init__()
+        super(NOBS, self).__init__()
         self.args = args
 
-    def zca_forward(self, x):
-        feature_dim, batch_size = x.size()
+    def find_nobs(self, x_old):
+        feature_dim, batch_size = x_old.size()
         assert feature_dim % self.args.group == 0
-        x = x.view(self.args.group, feature_dim // self.args.group, batch_size)
-        eps = 1e-4
-        f_cov = (torch.bmm(x, x.transpose(1, 2)) / (batch_size - 1)).float()  # N * N
-        eye = torch.eye(feature_dim // self.args.group).float().to(f_cov.device)
-        x_stack = torch.FloatTensor().to(f_cov.device)
-        for i in range(f_cov.size(0)):
-            f_cov = torch.where(torch.isnan(f_cov), torch.zeros_like(f_cov), f_cov)
-            U, S, V = torch.svd((1 - eps) * f_cov[i] + eps * eye)
-            diag = torch.diag(1.0 / torch.sqrt(S + 1e-5))
-            rotate_mtx = torch.mm(torch.mm(U, diag), U.transpose(0, 1)).detach()  # N * N
-            x_transform = torch.mm(rotate_mtx, x[i])
-            x_stack = torch.cat([x_stack, x_transform], dim=0)
-        return x_stack
+        try:
+            x = x_old.view(self.args.group, feature_dim // self.args.group, batch_size)
+            f_cov = (torch.bmm(x, x.transpose(1, 2)) / (batch_size - 1)).float()  # N * N
+            x_stack = torch.FloatTensor().to(f_cov.device)
+            for i in range(f_cov.size(0)):
+                f_cov = torch.where(torch.isnan(f_cov), torch.zeros_like(f_cov), f_cov)
+                U, S, V = torch.svd(f_cov[i])
+                diag = torch.diag(1.0 / torch.sqrt(S + 1e-5))
+                rotate_mtx = torch.mm(torch.mm(U, diag), U.transpose(0, 1)).detach()  # N * N
+                x_transform = torch.mm(rotate_mtx, x[i])
+                x_stack = torch.cat([x_stack, x_transform], dim=0)
+            return x_stack.detach()
+        except:
+            return x_old.detach()
 
 
 class LARS(optim.Optimizer):
@@ -419,6 +424,19 @@ class Transform:
     #     y2 = self.transform_prime(x)
     #     return y1, y2
 
+@torch.no_grad()
+def concat_all_gather(tensor):
+    """
+    Performs all_gather operation on the provided tensors.
+    *** Warning ***: torch.distributed.all_gather has no gradient.
+    """
+    tensors_gather = [torch.ones_like(tensor)
+        for _ in range(torch.distributed.get_world_size())]
+    torch.distributed.all_gather(tensors_gather, tensor, async_op=False)
+
+    output = torch.cat(tensors_gather, dim=0)
+    return output
 
 if __name__ == '__main__':
+    torch.manual_seed(3407)
     main()
