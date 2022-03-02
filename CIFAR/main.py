@@ -20,7 +20,7 @@ import torch.nn.functional as F
 from sklearn.cluster import KMeans
 
 parser = argparse.ArgumentParser(description='Barlow Twins Training')
-parser.add_argument('--data', type=Path, metavar='DIR', default='../',
+parser.add_argument('--data', type=Path, metavar='DIR', default='/home/zhangshaofeng/dataset/',
                     help='path to dataset')
 parser.add_argument('--dataset', type=str, metavar='dataset name', default='cifar100',
                     help='cifar10, cifar100')
@@ -189,8 +189,7 @@ class BarlowTwins(nn.Module):
 
         # normalization layer for the representations z1 and z2
         self.bn = nn.BatchNorm1d(sizes[-1], affine=False)
-        self.whiten_net = WhitenTran()
-        self.whiten_bn = nn.BatchNorm1d(sizes[-1], affine=False)
+        self.nobs_net = NOBS()
 
     def forward(self, y1, y2):
         z1 = self.projector(self.backbone(y1))
@@ -222,11 +221,11 @@ def assignment_fea_loss(z1, z2, args):
         idx = torch.randperm(z1.size(0))
         z1 = z1[idx, :]
         z2 = z2[idx, :]
-    whiten_net = WhitenTran()
+    nobs_net = NOBS()
     z1 = standardization(z1)
     z2 = standardization(z2)
-    z1_group = whiten_net.zca_forward(z1, args.group).detach()
-    z2_group = whiten_net.zca_forward(z2, args.group).detach()
+    z1_group = nobs_net.find_nobs(z1, args.group).detach()
+    z2_group = nobs_net.find_nobs(z2, args.group).detach()
 
     c = (z1 * z2_group).sum(dim=-1)
     c.div_(list(map(int, args.projector.split('-')))[-1])
@@ -257,42 +256,35 @@ def standardization(data, eps=1e-5):
     sigma = torch.std(data, dim=-1, keepdim=True)
     return (data - mu) / (sigma+eps)
 
-class WhitenTran(nn.Module):
+class NOBS(nn.Module):
     def __init__(self, eps=0.01, dim=256):
-        super(WhitenTran, self).__init__()
+        super(NOBS, self).__init__()
         self.eps = eps
         self.dim = dim
 
-    def cholesky_forward(self, x):
-        """normalized tensor"""
-        batch_size, feature_dim = x.size()
-        f_cov = torch.mm(x.transpose(0, 1), x) / (batch_size - 1) # d * d
-        eye = torch.eye(feature_dim).float().to(f_cov.device)
-        f_cov_shrink = (1 - self.eps) * f_cov + self.eps * eye
-        inv_sqrt = torch.triangular_solve(eye, torch.linalg.cholesky(f_cov_shrink.float()), upper=False)[0]
-        inv_sqrt = inv_sqrt.contiguous().view(feature_dim, feature_dim).detach()
-        return torch.mm(inv_sqrt, x.transpose(0, 1)).transpose(0, 1)    # N * d
-
-    def zca_forward(self, x, group_num):
+    def find_nobs(self, x_old, group_num):
         """
         :param x: group normalization [batch, feature dim]
         :return:
         """
-        feature_dim, batch_size = x.size()
-        assert feature_dim % group_num == 0
-        x = x.view(group_num, feature_dim//group_num, batch_size)
-        eps = 1e-4
-        f_cov = (torch.bmm(x, x.transpose(1, 2)) / (batch_size - 1)).float()  # N * N
-        eye = torch.eye(feature_dim//group_num).float().to(f_cov.device)
-        x_stack = torch.FloatTensor().to(f_cov.device)
-        for i in range(f_cov.size(0)):
-            f_cov = torch.where(torch.isnan(f_cov), torch.zeros_like(f_cov), f_cov)
-            U, S, V = torch.svd((1 - eps) * f_cov[i] + eps * eye)
-            diag = torch.diag(1.0 / torch.sqrt(S + 1e-5))
-            rotate_mtx = torch.mm(torch.mm(U, diag), U.transpose(0, 1)).detach()  # N * N
-            x_transform = torch.mm(rotate_mtx, x[i])
-            x_stack = torch.cat([x_stack, x_transform], dim=0)
-        return x_stack
+        try:
+            feature_dim, batch_size = x_old.size()
+            assert feature_dim % group_num == 0
+            x = x_old.view(group_num, feature_dim//group_num, batch_size)
+            eps = 1e-4
+            f_cov = (torch.bmm(x, x.transpose(1, 2)) / (batch_size - 1)).float()  # N * N
+            eye = torch.eye(feature_dim//group_num).float().to(f_cov.device)
+            x_stack = torch.FloatTensor().to(f_cov.device)
+            for i in range(f_cov.size(0)):
+                f_cov = torch.where(torch.isnan(f_cov), torch.zeros_like(f_cov), f_cov)
+                U, S, V = torch.svd((1 - eps) * f_cov[i] + eps * eye)
+                diag = torch.diag(1.0 / torch.sqrt(S + 1e-5))
+                rotate_mtx = torch.mm(torch.mm(U, diag), U.transpose(0, 1)).detach()  # N * N
+                x_transform = torch.mm(rotate_mtx, x[i])
+                x_stack = torch.cat([x_stack, x_transform], dim=0)
+            return x_stack
+        except:
+            return x_old
 
     def pca_forward(self, x):
         batch_size, feature_dim = x.size()
@@ -373,7 +365,7 @@ class TransformCIFAR:
                 p=0.8
             ),
             transforms.RandomGrayscale(p=0.2),
-            transforms.RandomApply([GaussianBlur()], p=0.0),
+            transforms.RandomApply([GaussianBlur()], p=0.2),
             transforms.RandomApply([Solarization()], p=0.0),
             transforms.ToTensor(),
             transforms.Normalize((0.4914, 0.4822, 0.4465), (0.247, 0.243, 0.261))
@@ -387,7 +379,7 @@ class TransformCIFAR:
                 p=0.8
             ),
             transforms.RandomGrayscale(p=0.2),
-            transforms.RandomApply([GaussianBlur()], p=0.0),
+            transforms.RandomApply([GaussianBlur()], p=0.1),
             transforms.RandomApply([Solarization()], p=0.2),
             transforms.ToTensor(),
             transforms.Normalize((0.4914, 0.4822, 0.4465), (0.247, 0.243, 0.261))
