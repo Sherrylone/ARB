@@ -1,6 +1,6 @@
-# Align Representations with Base: A New Approach to Self-Supervised Learning (CVPR 2022)
+# Align Representations with Base: A New Approach to Self-Supervised Learning
 
-Code of CVPR 22 paper "[Align Representations with Base: A New Approach to Self-Supervised Learning](https://github.com/Sherrylone/Align_Representation_with_Base/blob/main/01148.pdf)"
+Code of CVPR 22 paper "[Align Representations with Base: A New Approach to Self-Supervised Learning](sherrylone.github.io/../../pages/assets/CVPR22_ARB.pdf)"
 
 [![ARB](https://github.com/Sherrylone/Align_Representation_with_Base/blob/main/framework.png)](https://github.com/Sherrylone/Align_Representation_with_Base/blob/main/framework.png)
 
